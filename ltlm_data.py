@@ -1,9 +1,8 @@
 import os
 import pdb
 import re
-import torch
+import numpy as np
 from collections import Counter, OrderedDict
-import torchtext.vocab
 
 SOS = "<sos>"
 EOS = "<eos>"
@@ -12,6 +11,40 @@ UNK = "<unk>"
 MIN_FREQ = 10
 MIN_DOC_FREQ = 100
 MAX_FREQ_PCT = 0.001
+
+
+class Vocab:
+    def __init__(self, ordered_dict):
+        def build():
+            self.vocabxfreq = ordered_dict
+            self.vocabxid = {}
+            self.idxvocab = {}
+
+            for i, (word, _) in enumerate(ordered_dict.items()):
+                self.vocabxid[word] = i
+                self.idxvocab[i] = word
+
+        build()
+        self.unk = None
+
+    def __len__(self):
+        return len(self.vocabxid)
+
+    def __getitem__(self, key):
+        if key in self.vocabxid:
+            return self.vocabxid[key]
+        else:
+            return self.vocabxid[self.unk]
+
+    def get_word(self, id):
+        if id in self.idxvocab.keys():
+            return self.idxvocab[id]
+        else:
+            return None
+
+    def set_unk(self, unk):
+        self.unk = unk
+
 
 # tdlm data: each line is a document, already tokenized
 # sentences are separated by \t and the end of the document has an extra \n
@@ -64,10 +97,15 @@ def create_vocab(counter, doc_counter, stopwords):
     if "n't" in filtered:
         ignore.add("n't")
 
+    def move_to_end(ordered_dict, key):
+        value = ordered_dict[key]
+        del ordered_dict[key]
+        ordered_dict[key] = value
+
     filtered_ordered = OrderedDict(filtered)
     for token in ignore:
         if token in filtered_ordered:
-            filtered_ordered.move_to_end(token)
+            move_to_end(filtered_ordered, token)
         else:
             filtered_ordered[token] = 1
 
@@ -84,8 +122,8 @@ def create_vocab(counter, doc_counter, stopwords):
     for k, v in sorted_ignore:
         final_ordered[k] = v
 
-    vocab = torchtext.vocab.vocab(final_ordered)
-    vocab.set_default_index(vocab.lookup_indices([UNK])[0])
+    vocab = Vocab(final_ordered)
+    vocab.set_unk(UNK)
 
     return vocab, len(vocab) - len(ignore)
 
@@ -95,6 +133,7 @@ def process_dataset(
     stopwords,
     data_path,
     sequence_length,
+    doc_length,
     reproduce_tdlm=False,
     vocab=None,
     val_only=False,
@@ -115,36 +154,38 @@ def process_dataset(
         vocab = new_vocab
 
     def create_sequence_context_tuples_v2(docs):
-        doc_bows = torch.zeros((len(docs), num_tm_words))
-        doc_num_tokens = torch.zeros(len(docs))
+        # doc_bows = np.zeros((len(docs), num_tm_words))
+        doc_bows = np.full((len(docs), doc_length + sequence_length), vocab[PAD])
+        doc_num_tokens = np.zeros(len(docs))
         docs_segmented = []
         sequence_count = 0
 
         for idx, doc in enumerate(docs):
-            # if idx >= 300:
+            # if idx >= 100:
             #     break
             doc = SOS + " " + doc[:-1] + " " + EOS
             sent_delim_str = " " + EOS + " " if reproduce_tdlm else " "
             doc = doc.replace("\t", sent_delim_str).split(" ")
             doc_tokens = []
+            bows_idx = 0
             for word in doc:
                 token = vocab[word]
-                if token < num_tm_words:
-                    doc_bows[idx][token] += 1
+                if token < num_tm_words and bows_idx < len(doc_bows[idx]):
+                    doc_bows[idx][bows_idx] += 1
+                    bows_idx += 1
                 doc_tokens.append(token)
-            doc_tokens = torch.tensor(doc_tokens)
             doc_num_tokens[idx] = len(doc_tokens)
             sequences = []
             docs_segmented.append(sequences)
 
             for start_idx in range(0, len(doc_tokens), sequence_length):
-                sequence = torch.full((sequence_length + 1,), vocab[PAD])
+                sequence = np.full((sequence_length + 1,), vocab[PAD])
                 end_idx = min(
                     len(doc_tokens), start_idx + sequence_length + 1
                 )  # add extra token for target
                 num_non_pad_tokens = end_idx - start_idx
                 sequence[:num_non_pad_tokens] = doc_tokens[start_idx:end_idx]
-                bows = torch.zeros(num_tm_words)
+                bows = np.zeros(num_tm_words)
                 for token in sequence[:num_non_pad_tokens]:
                     if token < num_tm_words:
                         bows[token] += 1
@@ -152,7 +193,7 @@ def process_dataset(
                 sequence_count += 1
 
         print(
-            f"Finished loading data: {sequence_count} sequences and {len(docs_segmented)} docs."
+            "Finished loading data: {} sequences and {} docs.".format(sequence_count, len(docs_segmented))
         )
 
         return docs_segmented, doc_bows, doc_num_tokens
@@ -166,6 +207,7 @@ def process_dataset(
     return train_data, val_data, test_data, vocab, num_tm_words
 
 
+# TODO: Implement returning bows correctly (bows should be tokens corresponding to first 300 words in document, minus current sequence)
 def get_batch_v2(
     cf,
     batch_size,
@@ -178,10 +220,10 @@ def get_batch_v2(
 ):
     sequences = []
     bows = []
-    stopwords = []
+    masks = []
     cur_doc_idxs = []
     cur_sequence_idxs = []
-    is_last_sequence = torch.zeros(batch_size, dtype=torch.bool)
+    is_last_sequence = np.zeros(batch_size)
     next_doc_idx = 0 if prev_doc_idxs is None else max(prev_doc_idxs) + 1
 
     for i in range(batch_size):
@@ -209,30 +251,32 @@ def get_batch_v2(
 
         sequence, seq_bows = docs_segmented[doc_idx][sequence_idx]
         sequences.append(sequence)
-        if prev_doc_idxs is None or doc_idx != prev_doc_idx:
-            prev_running_bows[i] = 0
-        if evaluate and not cf.eval_false:
-            context = prev_running_bows[i].clone().detach()
-        elif not cf.use_all_bows:
-            context = doc_bows[doc_idx] - seq_bows
-        else:
-            context = doc_bows[doc_idx]
-        bows.append(context)
-        prev_running_bows[i] += seq_bows  # Add current bows only for the next batch
-        stopwords.append(
-            sequences[-1].clone().detach().apply_(lambda idx: idx >= cf.num_tm_words)
-        )
+        mask = np.ones(len(sequence))
+        if sequence[-1] == cf.pad_idx:
+            mask[(sequence == cf.pad_idx).argmax() :] = 0
+        masks.append(mask)
+        # if prev_doc_idxs is None or doc_idx != prev_doc_idx:
+        #     prev_running_bows[i] = 0
+        # if evaluate and not cf.eval_false:
+        #     context = prev_running_bows[i].clone().detach()
+        # elif not cf.use_all_bows:
+        #     context = doc_bows[doc_idx] - seq_bows
+        # else:
+        #     context = doc_bows[doc_idx]
+        # bows.append(context)
+        # prev_running_bows[i] += seq_bows  # Add current bows only for the next batch
         cur_doc_idxs.append(doc_idx)
         cur_sequence_idxs.append(sequence_idx)
 
-    batch = torch.stack(sequences, dim=1)
-    bows = torch.stack(bows)
-    stopwords = torch.stack(stopwords, dim=1)
+    batch = np.stack(sequences)
+    mask = np.stack(masks)
+    # bows = np.stack(bows)
     return (
-        batch[:-1],
-        bows,
-        stopwords,
-        batch[1:].view(-1),
+        batch[:, :-1],
+        # bows,
+        None,
+        batch[:, 1:],
+        mask[:, 1:],
         cur_doc_idxs,
         cur_sequence_idxs,
         is_last_sequence,
