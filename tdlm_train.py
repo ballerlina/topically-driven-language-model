@@ -33,9 +33,9 @@ args = parser.parse_args()
 ###########
 #functions#
 ###########
-def run_epoch(data, models, is_training, ltlm_cf):
+def run_epoch(data, models, is_training, ltlm_cf, num_batches):
     ####unsupervised topic and language model training####
-    docs_segmented, doc_bows, doc_num_tokens = train_data
+    docs_segmented, doc_bows, doc_num_tokens = data
     batch_idx = 0
     prev_doc_idxs = None
     prev_sequence_idxs = None
@@ -70,8 +70,8 @@ def run_epoch(data, models, is_training, ltlm_cf):
             prev_running_bows,
         )
         if data is None:
-            # if epoch == 1:
-            #     print(f"{batch_idx} total batches")
+            if num_batches is None:
+                num_batches = batch_idx
             break
         batch_idx += 1
 
@@ -80,6 +80,8 @@ def run_epoch(data, models, is_training, ltlm_cf):
         # Train LM
         # data = (bsz x seq_len)
         model = models[1]
+        # if batch_idx == 1:
+            # pdb.set_trace()
         feed_dict = {model.x: data, model.y: target, model.lm_mask: mask}
         if cf.topic_number > 0:
             feed_dict.update({model.doc: bows, model.tag: None})
@@ -102,15 +104,15 @@ def run_epoch(data, models, is_training, ltlm_cf):
             lm_words += np.sum(mask)
 
         #print progress
-        output_string = "%d: tm ppl = %.3f; lm ppl = %.3f; word/sec = %.1f" % \
-            (batch_idx, np.exp(tm_costs/max(tm_words, 1.0)), np.exp(lm_costs/max(lm_words, 1.0)),  \
+        output_string = "%d/%d: tm ppl = %.3f; lm ppl = %.3f; word/sec = %.1f" % \
+            (batch_idx, num_batches if num_batches is not None else -1, np.exp(tm_costs/max(tm_words, 1.0)), np.exp(lm_costs/max(lm_words, 1.0)),  \
             float(tm_words + lm_words)/(time.time()-start_time))
         print_progress(batch_idx, is_training, output_string)
 
     if cf.verbose:
         sys.stdout.write("\n")
             
-    return np.exp(lm_costs/max(lm_words, 1.0))
+    return np.exp(lm_costs/max(lm_words, 1.0)), num_batches
 
 def print_progress(bi, is_training, output_string):
     if ((bi % 200) == 0) and cf.verbose:
@@ -119,6 +121,7 @@ def print_progress(bi, is_training, output_string):
         else:
             sys.stdout.write("VALID ")
         sys.stdout.write(output_string + "\r")
+        # sys.stdout.write(output_string + "\n")
         sys.stdout.flush()
 
 ######
@@ -203,13 +206,15 @@ with tf.Graph().as_default(), tf.Session() as sess:
 
     #train model
     prev_ppl = None
+    num_train_batches = None
+    num_val_batches = None
+
     for i in xrange(cf.epoch_size):
         print "\nEpoch =", i
         #run a train epoch
-        run_epoch(train_data, (tm_train, lm_train), True, ltlm_cf)
+        _, num_train_batches = run_epoch(train_data, (tm_train, lm_train), True, ltlm_cf, num_train_batches)
         #run a valid epoch
-        curr_ppl = run_epoch(val_data, (tm_valid, lm_valid), False, ltlm_cf)
-    
+        curr_ppl, num_val_batches = run_epoch(val_data, (tm_valid, lm_valid), False, ltlm_cf, num_val_batches)
         if cf.save_model:
             if (i < 5) or (prev_ppl == None) or (curr_ppl < prev_ppl):
                 saver.save(sess, os.path.join(cf.output_dir, cf.output_prefix, "model.ckpt"))
@@ -244,7 +249,7 @@ with tf.Graph().as_default(), tf.Session() as sess:
 
                 s = mgen.generate_on_topic(sess, topic, vocab[SOS], temp, cf.lm_sent_len+10, \
                     vocab[EOS])
-                s = [ vocab[item] for item in s ]
+                s = [ vocab.get_word(item) for item in s ]
                 print " ".join(s)
 
     #save model vocab and configurations
