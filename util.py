@@ -1,10 +1,11 @@
+import pdb
 import codecs
 import sys
 import operator
 import math
 import re
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 def init_embedding(model, idxvocab):
     word_emb = []
@@ -86,9 +87,15 @@ def gen_vocab(dummy_symbols, corpus, stopwords, vocab_minfreq, vocab_maxfreq, ve
     idxvocab = []
     vocabxid = defaultdict(int)
     vocab_freq = defaultdict(int)
+    doc_counter = Counter()
+
     for line_id, line in enumerate(codecs.open(corpus, "r", "utf-8")):
+        doc_words = set()
         for word in line.strip().split():
             vocab_freq[word] += 1
+            doc_words.add(word)
+        for word in doc_words:
+            doc_counter[word] += 1
         if line_id % 1000 == 0 and verbose:
             sys.stdout.write(str(line_id) + " processed\r")
             sys.stdout.flush()
@@ -108,9 +115,10 @@ def gen_vocab(dummy_symbols, corpus, stopwords, vocab_minfreq, vocab_maxfreq, ve
     stopwords = set([item.strip().lower() for item in open(stopwords)])
     freqwords = set([item[0] for item in sorted(vocab_freq.items(), key=operator.itemgetter(1), \
         reverse=True)[:int(float(len(vocab_freq))*vocab_maxfreq)]]) #ignore top N% most frequent words for topic model
+    freqwords_doc = {item for item, doc_freq in doc_counter.items() if doc_freq < 100}
     alpha_check = re.compile("[a-zA-Z]")
     symbols = set([ w for w in vocabxid.keys() if ((alpha_check.search(w) == None) or w.startswith("'")) ])
-    ignore = stopwords | freqwords | symbols | set(dummy_symbols) | set(["n't"])
+    ignore = stopwords | freqwords | symbols | set(dummy_symbols) | set(["n't"]) | freqwords_doc
     ignore = set([vocabxid[w] for w in ignore if w in vocabxid])
 
     return idxvocab, vocabxid, ignore
@@ -126,6 +134,8 @@ def gen_data(vocabxid, dummy_symbols, ignore, corpus, tm_sent_len, lm_sent_len, 
     unk_symbol = dummy_symbols[3]
 
     for line_id, line in enumerate(codecs.open(corpus, "r", "utf-8")):
+        # if line_id >= 300:
+        #     break
         tm_sents = [vocabxid[start_symbol]] #sentences for tm
         lm_sents = [] #sentences for lm
         for s in line.strip().split("\t"):
